@@ -28,12 +28,12 @@ class ControlConfig:
 
     # 位置限位
     POSITION_LIMITS = {
-        'X': (0, 400),         # mm
-        'Y': (-300, 300),
-        'Z': (0, 500),
-        'RX': (-120, 120),     # degrees
-        'RY': (-70, 70),
-        'RZ': (-150, 150)
+        'X': (-100, 500),      # mm
+        'Y': (-400, 400),
+        'Z': (-50, 600),
+        'RX': (-180, 180),     # degrees
+        'RY': (-180, 180),
+        'RZ': (-180, 180)
     }
 
     # 软限位缓冲区
@@ -194,6 +194,9 @@ class XboxArmController:
                   f"RX={self.state.current_pose[3]:.1f} "
                   f"RY={self.state.current_pose[4]:.1f} "
                   f"RZ={self.state.current_pose[5]:.1f}")
+
+            # 更新看门狗时间戳，防止初始化后立即超时
+            self.safety.last_can_communication = time.time()
             return True
 
         except Exception as e:
@@ -445,6 +448,8 @@ class XboxArmController:
                 end_pose.end_pose.RY_axis / 1000.0,
                 end_pose.end_pose.RZ_axis / 1000.0
             ]
+            # 成功读取位姿，更新看门狗时间戳
+            self.safety.last_can_communication = time.time()
         except Exception as e:
             print(f"[ERROR] 读取位姿失败: {e}")
             self.safety.consecutive_errors += 1
