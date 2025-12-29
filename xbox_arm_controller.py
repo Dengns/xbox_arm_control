@@ -226,6 +226,40 @@ class XboxArmController:
             self.piper.GripperCtrl(0, self.config.GRIPPER_SPEED, 0x01, 0)
             time.sleep(0.1)
 
+            # 移动到零位（使用关节控制模式）
+            print("[INFO] 正在移动到零位...")
+            self.piper.MotionCtrl_2(0x01, 0x01, 30, 0x00)  # 关节控制模式，速度30%
+            self.piper.JointCtrl(0, 0, 0, 0, 0, 0)  # 所有关节移动到0°
+
+            # 等待到达零位
+            for i in range(100):  # 最多等待10秒
+                time.sleep(0.1)
+                joint = self.piper.GetArmJointMsgs()
+                current_joints = [
+                    joint.joint_state.joint_1 * 0.001,
+                    joint.joint_state.joint_2 * 0.001,
+                    joint.joint_state.joint_3 * 0.001,
+                    joint.joint_state.joint_4 * 0.001,
+                    joint.joint_state.joint_5 * 0.001,
+                    joint.joint_state.joint_6 * 0.001
+                ]
+                # 检查是否接近零位 (误差小于2度)
+                all_near_zero = all(abs(j) < 2.0 for j in current_joints)
+                if all_near_zero:
+                    print("[INFO] 已到达零位")
+                    break
+                if i % 10 == 0:
+                    print(f"[INFO] 移动中... J1={current_joints[0]:.1f}° "
+                          f"J2={current_joints[1]:.1f}° J3={current_joints[2]:.1f}°")
+            else:
+                print("[WARNING] 零位移动超时，继续启动")
+
+            time.sleep(0.2)
+
+            # 切换回末端位姿控制模式
+            self.piper.MotionCtrl_2(0x01, 0x00, 100, 0x00)
+            time.sleep(0.1)
+
             # 读取初始位姿
             end_pose = self.piper.GetArmEndPoseMsgs()
             self.state.current_pose = [
@@ -563,6 +597,24 @@ class XboxArmController:
                         if not self.state.enabled:
                             print("\n[INFO] 控制器已使能")
                             self.state.enabled = True
+                            # 重新使能机械臂
+                            self.piper.EnableArm(7)
+                            time.sleep(0.05)
+                            # 重新读取当前位姿作为起点
+                            self.update_current_pose()
+                            self.state.target_pose = self.state.current_pose.copy()
+                            self.state.pose_initialized = True
+                            # 发送当前位姿锁定位置
+                            end_pose = self.piper.GetArmEndPoseMsgs()
+                            self.piper.MotionCtrl_2(0x01, 0x00, 50, 0x00)
+                            self.piper.EndPoseCtrl(
+                                end_pose.end_pose.X_axis,
+                                end_pose.end_pose.Y_axis,
+                                end_pose.end_pose.Z_axis,
+                                end_pose.end_pose.RX_axis,
+                                end_pose.end_pose.RY_axis,
+                                end_pose.end_pose.RZ_axis
+                            )
 
                         # 更新当前位姿
                         self.update_current_pose()
