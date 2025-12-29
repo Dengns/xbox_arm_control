@@ -1,12 +1,60 @@
 #!/usr/bin/env python3
 """
+位置控制的奇异点太多，不建议使用位置控制模式
 Xbox控制器控制Piper机械臂
 使用速度控制模式，LB键作为使能开关
+
+
+==============================================================================
+                            操作说明
+==============================================================================
+
+启动方式:
+    python3 xbox_arm_controller.py              # 默认使用 can0
+    python3 xbox_arm_controller.py --can can1   # 指定 CAN 端口
+    python3 xbox_arm_controller.py -c can_piper # 简写形式
+
+控制方式:
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  【重要】按住 LB 键才能使能控制，松开 LB 立即停止                    │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    摇杆控制:
+        左摇杆 Y 轴  → 末端 X 方向移动 (前后)
+        左摇杆 X 轴  → 末端 Y 方向移动 (左右)
+        右摇杆 X 轴  → 末端 RZ 旋转 (偏航/Yaw)
+        右摇杆 Y 轴  → 末端 Z 方向移动 (上下)
+
+    扳机控制:
+        LT 扳机      → 末端 RY 正向旋转 (俯仰/Pitch)
+        RT 扳机      → 末端 RY 负向旋转 (俯仰/Pitch)
+
+    按钮控制:
+        A 按钮       → 末端 RX 正向旋转 (翻滚/Roll)
+        B 按钮       → 末端 RX 负向旋转 (翻滚/Roll)
+        LB 按钮      → 【使能开关】按住才能控制
+
+    十字键控制 (增量模式):
+        十字键 ↑     → 按住持续张开夹爪
+        十字键 ↓     → 按住持续闭合夹爪
+        松开         → 停止
+
+    退出:
+        Ctrl + C     → 安全退出程序
+
+安全机制:
+    - 松开 LB 立即停止所有运动
+    - 位置软限位保护
+    - CAN 通信超时检测
+    - 连续错误自动紧急停止
+
+==============================================================================
 """
 
 import pygame
 import time
 import sys
+import argparse
 from typing import Optional, Tuple, List
 from piper_sdk import C_PiperInterface_V2
 
@@ -40,10 +88,10 @@ class ControlConfig:
     SOFT_LIMIT_BUFFER = 20  # mm或degrees
 
     # 夹爪参数
-    GRIPPER_OPEN_POS = 50000    # 50mm
-    GRIPPER_CLOSE_POS = 0
+    GRIPPER_MAX_POS = 80000     # 最大开度 80mm
+    GRIPPER_MIN_POS = 0         # 最小开度 0mm
     GRIPPER_SPEED = 1000
-    GRIPPER_FORCE = 500
+    GRIPPER_STEP = 1500         # 每次循环增量 (按住时持续变化)
 
     # 控制频率
     CONTROL_FREQUENCY = 50  # Hz
@@ -55,10 +103,12 @@ class ControllerState:
     def __init__(self):
         self.enabled = False
         self.current_pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # [X, Y, Z, RX, RY, RZ]
+        self.target_pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]   # 目标位姿（累积）
         self.target_velocity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self.last_update_time = time.time()
         self.gripper_state = "idle"  # idle, opening, closing
-        self.gripper_target = 0
+        self.gripper_pos = 0  # 当前夹爪位置 (单位: 0.001mm)
+        self.pose_initialized = False  # 目标位姿是否已初始化
 
 
 class SafetyMonitor:
@@ -186,6 +236,21 @@ class XboxArmController:
                 end_pose.end_pose.RY_axis / 1000.0,
                 end_pose.end_pose.RZ_axis / 1000.0
             ]
+
+            # 用当前位姿初始化目标位姿，防止连接时自动移动
+            self.state.target_pose = self.state.current_pose.copy()
+            self.state.pose_initialized = True
+
+            # 发送当前位姿作为目标，锁定当前位置
+            self.piper.MotionCtrl_2(0x01, 0x00, 10, 0x00)
+            self.piper.EndPoseCtrl(
+                end_pose.end_pose.X_axis,
+                end_pose.end_pose.Y_axis,
+                end_pose.end_pose.Z_axis,
+                end_pose.end_pose.RX_axis,
+                end_pose.end_pose.RY_axis,
+                end_pose.end_pose.RZ_axis
+            )
 
             print(f"[SUCCESS] 机械臂初始化完成")
             print(f"          当前位姿: X={self.state.current_pose[0]:.1f} "
@@ -323,8 +388,8 @@ class XboxArmController:
         current = self.state.current_pose.copy()
 
         # 计算速度 (mm/s 或 deg/s)
-        vel_x = inputs['left_x'] * self.config.LINEAR_VELOCITY_SCALE
-        vel_y = -inputs['left_y'] * self.config.LINEAR_VELOCITY_SCALE  # Y轴反转
+        vel_x = -inputs['left_y'] * self.config.LINEAR_VELOCITY_SCALE  # 左摇杆Y控制X方向
+        vel_y = inputs['left_x'] * self.config.LINEAR_VELOCITY_SCALE   # 左摇杆X控制Y方向
         vel_z = -inputs['right_y'] * self.config.LINEAR_VELOCITY_SCALE  # Z轴反转
 
         vel_rz = inputs['right_x'] * self.config.ANGULAR_VELOCITY_SCALE  # Yaw
@@ -404,32 +469,36 @@ class XboxArmController:
             print(f"[ERROR] 发送停止命令失败: {e}")
 
     def handle_gripper(self, inputs: dict):
-        """处理夹爪控制"""
+        """处理夹爪控制 - 增量模式"""
         try:
             if inputs['dpad_up']:
-                # 张开夹爪
-                if self.state.gripper_state != "opening":
-                    self.state.gripper_state = "opening"
-                    self.state.gripper_target = self.config.GRIPPER_OPEN_POS
-                    self.piper.GripperCtrl(
-                        self.config.GRIPPER_OPEN_POS,
-                        self.config.GRIPPER_SPEED,
-                        self.config.GRIPPER_FORCE,
-                        0
-                    )
+                # 按住 ↑ 持续张开
+                self.state.gripper_state = "opening"
+                self.state.gripper_pos += self.config.GRIPPER_STEP
+                # 限制最大值
+                if self.state.gripper_pos > self.config.GRIPPER_MAX_POS:
+                    self.state.gripper_pos = self.config.GRIPPER_MAX_POS
+                self.piper.GripperCtrl(
+                    int(self.state.gripper_pos),
+                    self.config.GRIPPER_SPEED,
+                    0x01,
+                    0
+                )
             elif inputs['dpad_down']:
-                # 闭合夹爪
-                if self.state.gripper_state != "closing":
-                    self.state.gripper_state = "closing"
-                    self.state.gripper_target = self.config.GRIPPER_CLOSE_POS
-                    self.piper.GripperCtrl(
-                        self.config.GRIPPER_CLOSE_POS,
-                        self.config.GRIPPER_SPEED,
-                        self.config.GRIPPER_FORCE,
-                        0
-                    )
+                # 按住 ↓ 持续闭合
+                self.state.gripper_state = "closing"
+                self.state.gripper_pos -= self.config.GRIPPER_STEP
+                # 限制最小值
+                if self.state.gripper_pos < self.config.GRIPPER_MIN_POS:
+                    self.state.gripper_pos = self.config.GRIPPER_MIN_POS
+                self.piper.GripperCtrl(
+                    int(self.state.gripper_pos),
+                    self.config.GRIPPER_SPEED,
+                    0x01,
+                    0
+                )
             else:
-                # 没有按键，保持当前状态
+                # 松开按键，停止
                 if self.state.gripper_state != "idle":
                     self.state.gripper_state = "idle"
 
@@ -459,7 +528,7 @@ class XboxArmController:
         pose = self.state.current_pose
         vel = self.state.target_velocity
         enabled_str = "已使能" if self.state.enabled else "未使能"
-        gripper_str = self.state.gripper_state
+        gripper_mm = self.state.gripper_pos / 1000.0  # 转换为 mm
 
         freq = self.config.CONTROL_FREQUENCY
 
@@ -467,7 +536,7 @@ class XboxArmController:
                  f"位姿:X={pose[0]:.0f}/Y={pose[1]:.0f}/Z={pose[2]:.0f}/"
                  f"RX={pose[3]:.0f}/RY={pose[4]:.0f}/RZ={pose[5]:.0f} | "
                  f"速度:vX={vel[0]:.0f}/vY={vel[1]:.0f}/vZ={vel[2]:.0f} | "
-                 f"[夹爪:{gripper_str}]")
+                 f"[夹爪:{gripper_mm:.1f}mm]")
 
         # 使用\r返回行首，实现同行更新
         print(f"\r{status}", end='', flush=True)
@@ -487,6 +556,9 @@ class XboxArmController:
                     # 检查使能键
                     lb_pressed = inputs['button_lb']
 
+                    # 夹爪控制不需要按 LB，随时可用
+                    self.handle_gripper(inputs)
+
                     if lb_pressed:
                         if not self.state.enabled:
                             print("\n[INFO] 控制器已使能")
@@ -498,6 +570,12 @@ class XboxArmController:
                         # 计算目标位姿
                         dt = time.time() - self.state.last_update_time
                         target_pose = self.calculate_target_pose(inputs, dt)
+
+                        # 调试输出（每100帧输出一次）
+                        if self.frame_count % 100 == 0:
+                            print(f"\n[DEBUG] 当前位姿: {self.state.current_pose}")
+                            print(f"[DEBUG] 目标位姿: {target_pose}")
+                            print(f"[DEBUG] 输入: LX={inputs['left_x']:.2f} LY={inputs['left_y']:.2f} RX={inputs['right_x']:.2f} RY={inputs['right_y']:.2f}")
 
                         # 安全检查
                         is_safe, error_msg = self.safety.check_safety(
@@ -511,9 +589,6 @@ class XboxArmController:
                         else:
                             print(f"\n[SAFETY] {error_msg} - 停止运动")
                             self.send_stop_command()
-
-                        # 处理夹爪
-                        self.handle_gripper(inputs)
 
                     else:
                         if self.state.enabled:
@@ -589,7 +664,26 @@ class XboxArmController:
 
 def main():
     """主函数"""
-    controller = XboxArmController("can_piper")
+    parser = argparse.ArgumentParser(
+        description="Xbox控制器控制Piper机械臂",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+    python3 xbox_arm_controller.py              # 默认使用 can0
+    python3 xbox_arm_controller.py --can can1   # 指定 CAN 端口
+    python3 xbox_arm_controller.py -c can_piper # 简写形式
+        """
+    )
+    parser.add_argument(
+        "-c", "--can",
+        type=str,
+        default="can0",
+        help="CAN 端口名称 (默认: can0)"
+    )
+    args = parser.parse_args()
+
+    print(f"[INFO] 使用 CAN 端口: {args.can}")
+    controller = XboxArmController(args.can)
 
     if controller.initialize():
         controller.run()
